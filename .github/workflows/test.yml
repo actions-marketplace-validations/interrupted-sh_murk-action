@@ -27,7 +27,7 @@ jobs:
         run: murk --version
 
   test-export:
-    name: Export (${{ matrix.os }})
+    name: Export, murk 0.13 (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
@@ -37,9 +37,9 @@ jobs:
 
       - name: Create test vault
         run: |
-          # Install murk to create the test vault.
-          VERSION=$(gh release view --repo interrupted-sh/murk --json tagName --jq '.tagName')
-          VERSION="${VERSION#v}"
+          # Install murk to create the test vault. Pinned to 0.13, the last
+          # release before signer trust; test-trusted-signers covers 0.14.
+          VERSION="0.13.0"
 
           case "$RUNNER_OS" in
             Linux)  TARGET="x86_64-unknown-linux-gnu" ;;
@@ -79,7 +79,11 @@ jobs:
         uses: ./
         with:
           murk-key: ${{ env.TEST_MURK_KEY }}
+          version: '0.13.0'
           vault: 'test.murk'
+          # murk 0.13 ignores trusted-signers, so setting it must change nothing.
+          trusted-signers: |
+            age1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
 
       - name: Verify secrets are in environment
         run: |
@@ -89,6 +93,69 @@ jobs:
           test "$SPECIAL" = 'val with $pecial chars & stuff' || { echo "FAIL: SPECIAL mismatch"; exit 1; }
 
           echo "All assertions passed"
+
+  test-trusted-signers:
+    name: Trusted signers, murk 0.14 (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install murk 0.14 (vault will fail)
+        uses: ./
+        with:
+          murk-key: 'AGE-SECRET-KEY-1DUMMY'
+          version: '0.14.0'
+          vault: 'nonexistent.murk'
+        continue-on-error: true
+
+      - name: Export step on a fresh runner (unset, wrong and trusted signers)
+        run: test/trusted-signers.sh
+
+      - name: Create test vault signed by another machine
+        run: |
+          # The author's HOME holds their key and trust pin, so this runner's
+          # HOME stays as fresh as a CI runner's.
+          AUTHOR_HOME="${RUNNER_TEMP}/author-home"
+          mkdir -p "$AUTHOR_HOME"
+          echo "ci-test" | HOME="$AUTHOR_HOME" murk init --vault test.murk
+          MURK_KEY=$(cat "$(sed -n "s/^export MURK_KEY_FILE='\\(.*\\)'/\\1/p" .env)")
+          echo "hello_world" | HOME="$AUTHOR_HOME" MURK_KEY="$MURK_KEY" murk add GREETING --vault test.murk
+          {
+            echo "TEST_MURK_KEY=$MURK_KEY"
+            echo "TEST_SIGNER=$(HOME="$AUTHOR_HOME" MURK_KEY="$MURK_KEY" murk trust --print-key)"
+          } >> "$GITHUB_ENV"
+
+      # Runs before the trusted run: an accepted load records a trust pin in
+      # this runner's HOME, after which the vault would load without the input.
+      - name: Run murk-action without trusted-signers
+        id: untrusted
+        uses: ./
+        with:
+          murk-key: ${{ env.TEST_MURK_KEY }}
+          version: '0.14.0'
+          vault: 'test.murk'
+        continue-on-error: true
+
+      - name: Verify the action refused it
+        run: |
+          test "${{ steps.untrusted.outcome }}" = "failure" || { echo "FAIL: untrusted vault was loaded"; exit 1; }
+          test "${{ steps.untrusted.outputs.version }}" = "0.14.0" || { echo "FAIL: murk 0.14.0 was not installed, so the failure proves nothing"; exit 1; }
+          test -z "${GREETING:-}" || { echo "FAIL: GREETING was exported"; exit 1; }
+
+      - name: Run murk-action with trusted-signers
+        uses: ./
+        with:
+          murk-key: ${{ env.TEST_MURK_KEY }}
+          version: '0.14.0'
+          vault: 'test.murk'
+          trusted-signers: ${{ env.TEST_SIGNER }}
+
+      - name: Verify secrets are in environment
+        run: |
+          test "$GREETING" = "hello_world" || { echo "FAIL: GREETING='$GREETING'"; exit 1; }
 
   test-version-pin:
     name: Version pin

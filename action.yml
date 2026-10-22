@@ -6,10 +6,10 @@ branding:
 
 inputs:
   murk-key:
-    description: 'Age secret key (AGE-SECRET-KEY-1...)'
+    description: 'Age secret key (AGE-SECRET-KEY-1...), or a whole murk agent grant key file (its "# murk-..." comment lines and its AGE-SECRET-KEY-1... line), passed to murk unchanged'
     required: true
   version:
-    description: 'murk version to install, 0.10.2 or newer (e.g. "0.11.0" or "latest")'
+    description: 'murk version to install, 0.10.2 or newer (e.g. "0.14.0" or "latest"); murk 0.14 and later need trusted-signers or a whole grant key file as murk-key'
     required: false
     default: 'latest'
   vault:
@@ -18,6 +18,10 @@ inputs:
     default: '.murk'
   tags:
     description: 'Space-separated tags to filter exported secrets'
+    required: false
+    default: ''
+  trusted-signers:
+    description: 'Signers trusted to sign the vault, one per line or comma-separated: each signer''s `murk trust --print-key` output. Required by murk 0.14 and later; ignored by older murk'
     required: false
     default: ''
 
@@ -86,11 +90,14 @@ runs:
         INSTALL_DIR="${RUNNER_TEMP}/murk-bin"
         mkdir -p "$INSTALL_DIR"
 
+        # --clobber: an earlier run of this action in the same job left these
+        # files in RUNNER_TEMP; both are verified below either way.
         gh release download "v${VERSION}" \
           --repo interrupted-sh/murk \
           --pattern "$ARCHIVE" \
           --pattern "SHA256SUMS" \
-          --dir "$RUNNER_TEMP"
+          --dir "$RUNNER_TEMP" \
+          --clobber
 
         # Verify checksum (shasum for macOS portability).
         EXPECTED=$(grep -F "$ARCHIVE" "${RUNNER_TEMP}/SHA256SUMS" | cut -d' ' -f1)
@@ -133,14 +140,35 @@ runs:
       run: |
         set -euo pipefail
 
-        # Validate key format.
-        if [[ ! "$MURK_KEY" =~ ^AGE-SECRET-KEY-1 ]]; then
+        # Validate the key: a bare age secret key line, or a whole grant key
+        # file whose "# murk-trusted-signer:", "# murk-grant-id:" and
+        # "# murk-grant-expires:" lines murk reads and enforces. MURK_KEY reaches
+        # murk unchanged. Never echo a line of it: only the secret line is
+        # masked, and a multi-line ::add-mask:: would print the lines after the
+        # first.
+        KEY_LINE=""
+        while IFS= read -r line || [ -n "$line" ]; do
+          line="${line%$'\r'}"
+          case "$line" in
+            '' | '#'*) ;;
+            AGE-SECRET-KEY-1*)
+              echo "::add-mask::${line}"
+              if [ -n "$KEY_LINE" ]; then
+                echo "::error::murk-key holds more than one AGE-SECRET-KEY-1... line"
+                exit 1
+              fi
+              KEY_LINE="$line"
+              ;;
+            *)
+              echo "::error::murk-key must be an age secret key (AGE-SECRET-KEY-1...) or a murk grant key file (# comment lines and one AGE-SECRET-KEY-1... line)"
+              exit 1
+              ;;
+          esac
+        done <<< "$MURK_KEY"
+        if [ -z "$KEY_LINE" ]; then
           echo "::error::murk-key does not look like an age secret key (expected AGE-SECRET-KEY-1...)"
           exit 1
         fi
-
-        # Mask the key itself as defense-in-depth.
-        echo "::add-mask::${MURK_KEY}"
 
         # Build --tag arguments.
         TAG_ARGS=""
@@ -150,9 +178,34 @@ runs:
           done
         fi
 
-        # Run murk export (word splitting on TAG_ARGS is intentional).
+        # murk 0.14 and later only load a vault whose signer this machine
+        # trusts. A fresh runner has no trust pin, so trust comes from
+        # MURK_TRUSTED_SIGNERS. Older murk ignores it. Set it only when the input
+        # is given, so a MURK_TRUSTED_SIGNERS from the job's env still applies.
+        if [ -n "$INPUT_TRUSTED_SIGNERS" ]; then
+          export MURK_TRUSTED_SIGNERS="$INPUT_TRUSTED_SIGNERS"
+        fi
+
+        # Run murk export (word splitting on TAG_ARGS is intentional). Keep
+        # stderr to explain a trust refusal; it holds no secret values.
+        ERR_FILE=$(mktemp "${RUNNER_TEMP:-/tmp}/murk-export.XXXXXX")
         # shellcheck disable=SC2086
-        MURK_EXPORT=$(murk export --vault "$INPUT_VAULT" $TAG_ARGS)
+        if ! MURK_EXPORT=$(murk export --vault "$INPUT_VAULT" $TAG_ARGS 2>"$ERR_FILE"); then
+          cat "$ERR_FILE" >&2
+          # The backticks below are literal text, not command substitution.
+          # shellcheck disable=SC2016
+          if [ -z "${MURK_TRUSTED_SIGNERS:-}" ] && grep -q 'murk trust' "$ERR_FILE"; then
+            printf '::error::murk refused %s because its signer is not trusted on this runner. Set the trusted-signers input to the `murk trust --print-key` output of each teammate who signs the vault (murk 0.14 and later).\n' "$INPUT_VAULT"
+          elif [ -n "${MURK_TRUSTED_SIGNERS:-}" ] && grep -qE 'not a trusted signer|signing key that is not theirs' "$ERR_FILE"; then
+            printf '::error::murk refused %s because its signer does not match trusted-signers. Each entry must be the `murk trust --print-key` output of a teammate who signs the vault.\n' "$INPUT_VAULT"
+          elif grep -q 'grant key names no trusted signers' "$ERR_FILE"; then
+            printf '::error::murk-key is a grant key without its trusted signers. Paste the whole key file from `murk agent grant ... --out -` into murk-key, comment lines included, or set trusted-signers.\n'
+          fi
+          rm -f "$ERR_FILE"
+          exit 1
+        fi
+        cat "$ERR_FILE" >&2
+        rm -f "$ERR_FILE"
 
         if [ -z "$MURK_EXPORT" ]; then
           echo "::notice::No secrets exported from vault"
@@ -201,3 +254,4 @@ runs:
         MURK_KEY: ${{ inputs.murk-key }}
         INPUT_VAULT: ${{ inputs.vault }}
         INPUT_TAGS: ${{ inputs.tags }}
+        INPUT_TRUSTED_SIGNERS: ${{ inputs.trusted-signers }}
